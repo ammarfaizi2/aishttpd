@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <signal.h>
 
 struct http_client {
 	char	str_ip[INET6_ADDRSTRLEN + sizeof(":65535")];
@@ -78,6 +79,28 @@ static int accept_callback(struct ais_sock_tcp_cli *cli)
 	return 0;
 }
 
+struct ais_sock_tcp_srv *g_srv;
+
+static void handle_exit_signal(int sig)
+{
+	(void)sig;
+	ais_sock_tcp_srv_stop(g_srv);
+}
+
+static void setup_signal(struct ais_sock_tcp_srv *srv)
+{
+	struct sigaction sa;
+
+	g_srv = srv;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = &handle_exit_signal;
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGHUP, &sa, NULL);
+	sa.sa_handler = SIG_IGN;
+	sigaction(SIGPIPE, &sa, NULL);
+}
+
 int main(void)
 {
 	struct ais_sock_tcp_srv_iarg iarg = {
@@ -90,19 +113,20 @@ int main(void)
 	struct ais_sock_tcp_srv srv;
 	int r;
 
+	setup_signal(&srv);
 	r = ais_sock_tcp_srv_init(&srv, &iarg);
 	if (r < 0) {
 		fprintf(stderr, "Failed to initialize TCP server: %d\n", r);
-		return 1;
+		return -r;
 	}
 
 	ais_sock_tcp_srv_set_cb_accept(&srv, &accept_callback);
+	printf("Starting TCP server on [%s]:%hu...\n", iarg.bind_addr, iarg.port);
 	r = ais_sock_tcp_srv_run(&srv);
-	if (r < 0) {
+	if (r < 0)
 		fprintf(stderr, "Failed to run TCP server: %d\n", r);
-		ais_sock_tcp_srv_free(&srv);
-		return 1;
-	}
 
-	return r;
+	printf("Shutting down TCP server...\n");
+	ais_sock_tcp_srv_free(&srv);
+	return -r;
 }
