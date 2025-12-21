@@ -75,6 +75,11 @@ struct ais_sock_tcp_srv {
 	 */
 	int			fd;
 
+	/*
+	 * Epoll file descriptor for monitoring events.
+	 */
+	int			ep_fd;
+
 	int			sock_backlog;
 	struct ais_sock_addr	bind_addr;
 

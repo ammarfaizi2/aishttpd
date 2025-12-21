@@ -59,6 +59,7 @@ int ais_sock_tcp_srv_init(struct ais_sock_tcp_srv *srv, struct ais_sock_tcp_srv_
 	}
 
 	srv->fd = fd;
+	srv->ep_fd = ep_fd;
 	srv->nevents = iarg->epoll_nevents;
 	srv->max_clients = iarg->max_clients;
 	return 0;
@@ -165,7 +166,7 @@ static int __handle_event_tcp_srv(struct ais_sock_tcp_srv *srv)
 	ev.data.u64 = 0;
 	ev.data.ptr = cli;
 	ev.data.u64 |= AIS_EV_DATA_TCP_CLI;
-	if (epoll_ctl(srv->fd, EPOLL_CTL_ADD, cli->fd, &ev) < 0) {
+	if (epoll_ctl(srv->ep_fd, EPOLL_CTL_ADD, cli->fd, &ev) < 0) {
 		r = -errno;
 		cli->fd = -1;
 		ais_sock_tcp_cli_free(cli);
@@ -296,7 +297,7 @@ static int adjust_epoll_events(struct ais_sock_tcp_srv *srv, struct ais_sock_tcp
 		ev.data.u64 = 0;
 		ev.data.ptr = cli;
 		ev.data.u64 |= AIS_EV_DATA_TCP_CLI;
-		if (epoll_ctl(srv->fd, EPOLL_CTL_MOD, cli->fd, &ev) < 0)
+		if (epoll_ctl(srv->ep_fd, EPOLL_CTL_MOD, cli->fd, &ev) < 0)
 			return -errno;
 	}
 
@@ -338,7 +339,7 @@ static int handle_event_tcp_cli(struct ais_sock_tcp_srv *srv, struct epoll_event
 
 out_close:
 	if (ret < 0) {
-		epoll_ctl(srv->fd, EPOLL_CTL_DEL, cli->fd, NULL);
+		epoll_ctl(srv->ep_fd, EPOLL_CTL_DEL, cli->fd, NULL);
 		cli->fd = -1;
 		ais_sock_tcp_cli_free(cli);
 	}
@@ -385,7 +386,7 @@ static int fish_events(struct ais_sock_tcp_srv *srv)
 	size_t nevents = srv->nevents;
 	int r;
 
-	r = epoll_wait(srv->fd, events, nevents, 5000);
+	r = epoll_wait(srv->ep_fd, events, nevents, 5000);
 	if (r < 0) {
 		r = -errno;
 		return (r == -EINTR) ? 0 : r;
@@ -420,7 +421,7 @@ static int prepare_initial_epoll(struct ais_sock_tcp_srv *srv)
 	ev.data.ptr = srv;
 	ev.data.u64 |= AIS_EV_DATA_TCP_SRV;
 
-	if (epoll_ctl(srv->fd, EPOLL_CTL_ADD, srv->fd, &ev) < 0)
+	if (epoll_ctl(srv->ep_fd, EPOLL_CTL_ADD, srv->fd, &ev) < 0)
 		return -errno;
 
 	return 0;
