@@ -173,8 +173,6 @@ static int __handle_event_tcp_srv(struct ais_sock_tcp_srv *srv)
 		}
 	}
 
-	cli->idx = (uint32_t)srv->nclients++;
-	srv->clients[cli->idx] = cli;
 	cli->ep_mask = ev.events = EPOLLIN;
 	ev.data.u64 = 0;
 	ev.data.ptr = cli;
@@ -186,6 +184,8 @@ static int __handle_event_tcp_srv(struct ais_sock_tcp_srv *srv)
 		return r;
 	}
 
+	cli->idx = (uint32_t)srv->nclients++;
+	srv->clients[cli->idx] = cli;
 	return 0;
 
 out_err_free_cli:
