@@ -173,7 +173,8 @@ static int __handle_event_tcp_srv(struct ais_sock_tcp_srv *srv)
 		}
 	}
 
-	srv->clients[srv->nclients++] = cli;
+	cli->idx = (uint32_t)srv->nclients++;
+	srv->clients[cli->idx] = cli;
 	cli->ep_mask = ev.events = EPOLLIN;
 	ev.data.u64 = 0;
 	ev.data.ptr = cli;
@@ -351,8 +352,14 @@ static int handle_event_tcp_cli(struct ais_sock_tcp_srv *srv, struct epoll_event
 
 out_close:
 	if (ret < 0) {
+		uint32_t last_idx = (uint32_t)(srv->nclients - 1);
 		epoll_ctl(srv->ep_fd, EPOLL_CTL_DEL, cli->fd, NULL);
-		cli->fd = -1;
+		if (cli->idx != last_idx) {
+			srv->clients[cli->idx] = srv->clients[last_idx];
+			srv->clients[cli->idx]->idx = cli->idx;
+		}
+		srv->clients[last_idx] = NULL;
+		srv->nclients--;
 		ais_sock_tcp_cli_free(cli);
 	}
 	return 0;

@@ -47,6 +47,7 @@ typedef void (*ais_sock_tcp_cli_cb_close_t)(struct ais_sock_tcp_cli *cli);
 struct ais_sock_tcp_srv;
 struct ais_sock_tcp_cli {
 	int			fd;
+	uint32_t		idx;
 	void			*user_data;
 	struct ais_sock_buf	rx_buf;
 	struct ais_sock_buf	tx_buf;
