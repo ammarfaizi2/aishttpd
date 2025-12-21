@@ -1,0 +1,528 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (C) 2025  Alviro Iskandar Setiawan <alviro.iskandar@gnuweeb.org>
+ */
+#include "tcp.h"
+#include <errno.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+#include <assert.h>
+
+int ais_sock_tcp_srv_init(struct ais_sock_tcp_srv *srv, struct ais_sock_tcp_srv_iarg *iarg)
+{
+	struct ais_sock_addr *ba = &srv->bind_addr;
+	int err, fd, ep_fd;
+
+	memset(srv, 0, sizeof(*srv));
+	if (inet_pton(AF_INET, iarg->bind_addr, &ba->in.sin_addr) == 1) {
+		ba->in.sin_family = AF_INET;
+		ba->in.sin_port = htons(iarg->port);
+	} else if (inet_pton(AF_INET6, iarg->bind_addr, &ba->in6.sin6_addr) == 1) {
+		ba->in6.sin6_family = AF_INET6;
+		ba->in6.sin6_port = htons(iarg->port);
+	} else {
+		return -EINVAL;
+	}
+
+	if (iarg->sock_backlog < 0 || iarg->sock_backlog > SOMAXCONN)
+		return -EINVAL;
+
+	srv->sock_backlog = (iarg->sock_backlog == 0) ? SOMAXCONN : iarg->sock_backlog;
+
+	/*
+	 * Only create the socket, don't bind or listen yet. Allow
+	 * the caller to call setsockopt() before binding and listening.
+	 */
+	fd = socket(ba->sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
+	if (fd < 0)
+		return -errno;
+
+	ep_fd = epoll_create(128);
+	if (ep_fd < 0) {
+		err = -errno;
+		goto out_err_socket;
+	}
+
+	srv->events = calloc(iarg->epoll_nevents, sizeof(*srv->events));
+	if (!srv->events) {
+		err = -ENOMEM;
+		goto out_err_epoll;
+	}
+
+	srv->clients = calloc(iarg->max_clients, sizeof(*srv->clients));
+	if (!srv->clients) {
+		err = -ENOMEM;
+		goto out_err_events;
+	}
+
+	srv->fd = fd;
+	srv->nevents = iarg->epoll_nevents;
+	srv->max_clients = iarg->max_clients;
+	return 0;
+
+out_err_events:
+	free(srv->events);
+out_err_epoll:
+	close(ep_fd);
+out_err_socket:
+	close(fd);
+	memset(srv, 0, sizeof(*srv));
+	return err;
+}
+
+static void ais_sock_tcp_cli_free(struct ais_sock_tcp_cli *cli)
+{
+	if (cli->cb_close)
+		cli->cb_close(cli);
+
+	if (cli->fd >= 0)
+		close(cli->fd);
+
+	free(cli->rx_buf.buf);
+	free(cli->tx_buf.buf);
+	free(cli);
+}
+
+static void ais_sock_tcp_cli_free_all(struct ais_sock_tcp_srv *srv)
+{
+	struct ais_sock_tcp_cli *cli;
+	size_t i;
+
+	for (i = 0; i < srv->nclients; i++) {
+		cli = srv->clients[i];
+		if (!cli)
+			continue;
+
+		ais_sock_tcp_cli_free(cli);
+		srv->clients[i] = NULL;
+	}
+	srv->nclients = 0;
+}
+
+void ais_sock_tcp_srv_free(struct ais_sock_tcp_srv *srv)
+{
+	if (!srv)
+		return;
+
+	ais_sock_tcp_cli_free_all(srv);
+	free(srv->clients);
+	free(srv->events);
+	close(srv->fd);
+	memset(srv, 0, sizeof(*srv));
+}
+
+static int __handle_event_tcp_srv(struct ais_sock_tcp_srv *srv)
+{
+	struct ais_sock_addr addr;
+	struct ais_sock_tcp_cli *cli;
+	socklen_t addr_len = sizeof(addr);
+	struct epoll_event ev;
+	int r, fd;
+
+	fd = accept4(srv->fd, &addr.sa, &addr_len, SOCK_NONBLOCK);
+	if (fd < 0)
+		return -errno;
+
+	if (srv->nclients >= srv->max_clients) {
+		/*
+		 * Maximum clients reached, drop the connection.
+		 */
+		close(fd);
+		return -EAGAIN;
+	}
+
+	cli = calloc(1, sizeof(*cli));
+	if (!cli)
+		goto out_err_close;
+
+	/*
+	 * TODO(viro_ssfs): Make the buffer size configurable from the caller.
+	 */
+	r = ais_sock_buf_init(&cli->rx_buf, 8192);
+	if (r < 0)
+		goto out_err_free_cli;
+	r = ais_sock_buf_init(&cli->tx_buf, 8192);
+	if (r < 0)
+		goto out_err_free_cli;
+
+	cli->fd = fd;
+	cli->srv = srv;
+	cli->addr = addr;
+	if (srv->cb_accept) {
+		r = srv->cb_accept(cli);
+		if (r < 0) {
+			cli->fd = -1;
+			ais_sock_tcp_cli_free(cli);
+			return r;
+		}
+	}
+
+	srv->clients[srv->nclients++] = cli;
+	cli->ep_mask = ev.events = EPOLLIN;
+	ev.data.u64 = 0;
+	ev.data.ptr = cli;
+	ev.data.u64 |= AIS_EV_DATA_TCP_CLI;
+	if (epoll_ctl(srv->fd, EPOLL_CTL_ADD, cli->fd, &ev) < 0) {
+		r = -errno;
+		cli->fd = -1;
+		ais_sock_tcp_cli_free(cli);
+		return r;
+	}
+
+	return 0;
+
+out_err_free_cli:
+	ais_sock_tcp_cli_free(cli);
+out_err_close:
+	close(fd);
+	return -ENOMEM;
+}
+
+static int handle_event_tcp_srv(struct ais_sock_tcp_srv *srv, struct epoll_event *ev)
+{
+	if (ev->events & (EPOLLERR | EPOLLHUP))
+		return -EIO;
+
+	/*
+	 * If we get here, it must be an EPOLLIN event.
+	 */
+	assert(ev->events & EPOLLIN);
+
+	while (true) {
+		int r = __handle_event_tcp_srv(srv);
+		if (r < 0)
+			return (r == -EAGAIN) ? 0 : r;
+	}
+}
+
+static int handle_event_tcp_cli_recv(struct ais_sock_tcp_cli *cli)
+{
+	ssize_t recv_ret;
+	size_t recv_len;
+	void *recv_buf;
+
+	recv_len = cli->rx_buf.len - cli->rx_buf.off;
+	recv_buf = cli->rx_buf.buf + cli->rx_buf.off;
+	recv_ret = recv(cli->fd, recv_buf, recv_len, MSG_DONTWAIT);
+	if (recv_ret < 0) {
+		int err = -errno;
+		if (err == -EAGAIN || err == -EINTR) {
+			if (cli->rx_buf.off > 0)
+				goto invoke_cb;
+			return 0;
+		}
+
+		return err;
+	}
+
+	if (recv_ret == 0) {
+		/* Connection closed? */
+		return -EIO;
+	}
+
+	cli->rx_buf.off += recv_ret;
+
+invoke_cb:
+	if (cli->cb_rx) {
+		recv_ret = cli->cb_rx(cli);
+		if (recv_ret < 0)
+			return recv_ret;
+
+		assert((size_t)recv_ret <= cli->rx_buf.off);
+		ais_sock_buf_advance(&cli->rx_buf, (uint16_t)recv_ret);
+	}
+
+	return 0;
+}
+
+static int handle_event_tcp_cli_send(struct ais_sock_tcp_cli *cli)
+{
+	ssize_t send_ret;
+	size_t send_len;
+	void *send_buf;
+
+	send_len = cli->tx_buf.off;
+	send_buf = cli->tx_buf.buf;
+	send_ret = send(cli->fd, send_buf, send_len, MSG_DONTWAIT);
+	if (send_ret < 0) {
+		int err = -errno;
+		if (err == -EAGAIN || err == -EINTR)
+			return 0;
+
+		return err;
+	}
+
+	assert((size_t)send_ret <= cli->tx_buf.off);
+	ais_sock_buf_advance(&cli->tx_buf, (uint16_t)send_ret);
+	if (cli->cb_tx)
+		cli->cb_tx(cli, send_ret);
+
+	return 0;
+}
+
+static int adjust_epoll_events(struct ais_sock_tcp_srv *srv, struct ais_sock_tcp_cli *cli)
+{
+	bool need_mod = false;
+	/*
+	 * TODO(viro_ssfs):
+	 *  - Simplify the logic of this function.
+	 *  - Add handling for EPOLLIN enabling/disabling as well (when the rx_buf is full).
+	 */
+
+	/*
+	 * If we still have data to send and EPOLLOUT is not yet
+	 * enabled, enable it now!
+	 */
+	if (cli->tx_buf.off > 0 && !(cli->ep_mask & EPOLLOUT)) {
+		need_mod = true;
+		cli->ep_mask |= EPOLLOUT;
+	}
+
+	/*
+	 * If we have no more data to send and EPOLLOUT is enabled,
+	 * disable it.
+	 */
+	if (cli->tx_buf.off == 0 && (cli->ep_mask & EPOLLOUT)) {
+		need_mod = true;
+		cli->ep_mask &= ~EPOLLOUT;
+	}
+
+	if (need_mod) {
+		struct epoll_event ev;
+		ev.events = cli->ep_mask;
+		ev.data.u64 = 0;
+		ev.data.ptr = cli;
+		ev.data.u64 |= AIS_EV_DATA_TCP_CLI;
+		if (epoll_ctl(srv->fd, EPOLL_CTL_MOD, cli->fd, &ev) < 0)
+			return -errno;
+	}
+
+	return 0;
+}
+
+static int handle_event_tcp_cli(struct ais_sock_tcp_srv *srv, struct epoll_event *ev, void *udata)
+{
+	struct ais_sock_tcp_cli *cli = udata;
+	int ret;
+
+	if (ev->events & (EPOLLERR | EPOLLHUP)) {
+		ret = -EIO;
+		goto out_close;
+	}
+
+	if (ev->events & EPOLLIN) {
+		ret = handle_event_tcp_cli_recv(cli);
+		if (ret < 0)
+			goto out_close;
+
+		/*
+		 * cli->cb_rx() may give us some data to send.
+		 *
+		 * If so, enable EPOLLOUT event locally to notify
+		 * the code below to handle sending data.
+		 */
+		if (cli->tx_buf.off > 0)
+			ev->events |= EPOLLOUT;
+	}
+
+	if (ev->events & EPOLLOUT) {
+		ret = handle_event_tcp_cli_send(cli);
+		if (ret < 0)
+			goto out_close;
+	}
+
+	return adjust_epoll_events(srv, cli);
+
+out_close:
+	if (ret < 0) {
+		epoll_ctl(srv->fd, EPOLL_CTL_DEL, cli->fd, NULL);
+		cli->fd = -1;
+		ais_sock_tcp_cli_free(cli);
+	}
+	return 0;
+}
+
+static int handle_event(struct ais_sock_tcp_srv *srv, struct epoll_event *ev)
+{
+	uint64_t ev_data;
+	void *udata;
+
+	ev_data = AIS_EV_GET_DATA(ev->data.u64);
+	ev->data.u64 = AIS_EV_GET_PTR(ev->data.u64);
+	udata = ev->data.ptr;
+
+	switch (ev_data) {
+	case AIS_EV_DATA_TCP_SRV:
+		return handle_event_tcp_srv(srv, ev);
+	case AIS_EV_DATA_TCP_CLI:
+		return handle_event_tcp_cli(srv, ev, udata);
+	default:
+		assert(false && "Unknown event data");
+		return -EINVAL;
+	}
+}
+
+static int reap_events(struct ais_sock_tcp_srv *srv, int nevents)
+{
+	struct epoll_event *events = srv->events;
+	int r, i;
+
+	for (i = 0; i < nevents; i++) {
+		r = handle_event(srv, &events[i]);
+		if (r < 0)
+			return r;
+	}
+
+	return 0;
+}
+
+static int fish_events(struct ais_sock_tcp_srv *srv)
+{
+	struct epoll_event *events = srv->events;
+	size_t nevents = srv->nevents;
+	int r;
+
+	r = epoll_wait(srv->fd, events, nevents, 5000);
+	if (r < 0) {
+		r = -errno;
+		return (r == -EINTR) ? 0 : r;
+	}
+
+	return r;
+}
+
+static int start_event_loop(struct ais_sock_tcp_srv *srv)
+{
+	int r = 0;
+
+	while (!srv->should_stop) {
+		r = fish_events(srv);
+		if (r < 0)
+			break;
+
+		r = reap_events(srv, r);
+		if (r < 0)
+			break;
+	}
+
+	return r;
+}
+
+static int prepare_initial_epoll(struct ais_sock_tcp_srv *srv)
+{
+	struct epoll_event ev;
+
+	ev.events = EPOLLIN;
+	ev.data.u64 = 0;
+	ev.data.ptr = srv;
+	ev.data.u64 |= AIS_EV_DATA_TCP_SRV;
+
+	if (epoll_ctl(srv->fd, EPOLL_CTL_ADD, srv->fd, &ev) < 0)
+		return -errno;
+
+	return 0;
+}
+
+static int do_setsockopt(int skfd)
+{
+	int v = 1, r = 0;
+
+	r |= setsockopt(skfd, SOL_SOCKET, SO_REUSEADDR, &v, sizeof(v));
+	r |= setsockopt(skfd, SOL_SOCKET, SO_REUSEPORT, &v, sizeof(v));
+	r |= setsockopt(skfd, IPPROTO_TCP, TCP_NODELAY, &v, sizeof(v));
+	return r ? -errno : 0;
+}
+
+int ais_sock_tcp_srv_run(struct ais_sock_tcp_srv *srv)
+{
+	int err;
+
+	do_setsockopt(srv->fd);
+
+	if (bind(srv->fd, &srv->bind_addr.sa, sizeof(srv->bind_addr)) < 0)
+		return -errno;
+
+	if (listen(srv->fd, srv->sock_backlog) < 0)
+		return -errno;
+
+	err = prepare_initial_epoll(srv);
+	if (err < 0)
+		return err;
+
+	return start_event_loop(srv);
+}
+
+void ais_sock_tcp_srv_stop(struct ais_sock_tcp_srv *srv)
+{
+	srv->should_stop = true;
+}
+
+int ais_sock_buf_init(struct ais_sock_buf *sb, uint16_t size)
+{
+	sb->buf = malloc(size + 1);
+	if (!sb->buf)
+		return -ENOMEM;
+
+	sb->buf[0] = 0;
+	sb->len = size;
+	sb->off = 0;
+	return 0;
+}
+
+int ais_sock_buf_append(struct ais_sock_buf *sb, const void *data, uint16_t len)
+{
+	if (sb->off + len > sb->len)
+		return -ENOSPC;
+
+	memcpy(sb->buf + sb->off, data, len);
+	sb->off += len;
+	sb->buf[sb->off] = 0;
+	return 0;
+}
+
+int ais_sock_buf_append_grow(struct ais_sock_buf *sb, const void *data, uint16_t len)
+{
+	if (sb->off + len > sb->len) {
+		uint16_t new_len = sb->len * 2;
+		char *new_buf;
+
+		while (sb->off + len > new_len)
+			new_len *= 2;
+
+		new_buf = realloc(sb->buf, new_len + 1);
+		if (!new_buf)
+			return -ENOMEM;
+
+		sb->buf = new_buf;
+		sb->len = new_len;
+	}
+
+	memcpy(sb->buf + sb->off, data, len);
+	sb->off += len;
+	sb->buf[sb->off] = 0;
+	return 0;
+}
+
+void ais_sock_buf_free(struct ais_sock_buf *sb)
+{
+	if (!sb || !sb->buf)
+		return;
+
+	free(sb->buf);
+	memset(sb, 0, sizeof(*sb));
+}
+
+void ais_sock_buf_advance(struct ais_sock_buf *sb, uint16_t len)
+{
+	if (len >= sb->off) {
+		sb->off = 0;
+		sb->buf[0] = 0;
+	} else {
+		memmove(sb->buf, sb->buf + len, sb->off - len);
+		sb->off -= len;
+		sb->buf[sb->off] = 0;
+	}
+}
