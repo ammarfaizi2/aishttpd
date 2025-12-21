@@ -9,12 +9,13 @@
 #include <stdio.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
+#include <sys/eventfd.h>
 #include <assert.h>
 
 int ais_sock_tcp_srv_init(struct ais_sock_tcp_srv *srv, struct ais_sock_tcp_srv_iarg *iarg)
 {
 	struct ais_sock_addr *ba = &srv->bind_addr;
-	int err, fd, ep_fd;
+	int err, fd, ep_fd, ev_fd;
 
 	memset(srv, 0, sizeof(*srv));
 	if (inet_pton(AF_INET, iarg->bind_addr, &ba->in.sin_addr) == 1) {
@@ -40,10 +41,16 @@ int ais_sock_tcp_srv_init(struct ais_sock_tcp_srv *srv, struct ais_sock_tcp_srv_
 	if (fd < 0)
 		return -errno;
 
+	ev_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (ev_fd < 0) {
+		err = -errno;
+		goto out_err_socket;
+	}
+
 	ep_fd = epoll_create(128);
 	if (ep_fd < 0) {
 		err = -errno;
-		goto out_err_socket;
+		goto out_err_eventfd;
 	}
 
 	srv->events = calloc(iarg->epoll_nevents, sizeof(*srv->events));
@@ -60,6 +67,7 @@ int ais_sock_tcp_srv_init(struct ais_sock_tcp_srv *srv, struct ais_sock_tcp_srv_
 
 	srv->fd = fd;
 	srv->ep_fd = ep_fd;
+	srv->ev_fd = ev_fd;
 	srv->nevents = iarg->epoll_nevents;
 	srv->max_clients = iarg->max_clients;
 	return 0;
@@ -68,6 +76,8 @@ out_err_events:
 	free(srv->events);
 out_err_epoll:
 	close(ep_fd);
+out_err_eventfd:
+	close(ev_fd);
 out_err_socket:
 	close(fd);
 	memset(srv, 0, sizeof(*srv));
@@ -112,6 +122,8 @@ void ais_sock_tcp_srv_free(struct ais_sock_tcp_srv *srv)
 	free(srv->clients);
 	free(srv->events);
 	close(srv->fd);
+	close(srv->ep_fd);
+	close(srv->ev_fd);
 	memset(srv, 0, sizeof(*srv));
 }
 
@@ -360,6 +372,9 @@ static int handle_event(struct ais_sock_tcp_srv *srv, struct epoll_event *ev)
 		return handle_event_tcp_srv(srv, ev);
 	case AIS_EV_DATA_TCP_CLI:
 		return handle_event_tcp_cli(srv, ev, udata);
+	case AIS_EV_DATA_EV_FD:
+		eventfd_read(srv->ev_fd, &ev_data);
+		return 0;
 	default:
 		assert(false && "Unknown event data");
 		return -EINVAL;
@@ -386,7 +401,7 @@ static int fish_events(struct ais_sock_tcp_srv *srv)
 	size_t nevents = srv->nevents;
 	int r;
 
-	r = epoll_wait(srv->ep_fd, events, nevents, 5000);
+	r = epoll_wait(srv->ep_fd, events, nevents, -1);
 	if (r < 0) {
 		r = -errno;
 		return (r == -EINTR) ? 0 : r;
@@ -424,6 +439,13 @@ static int prepare_initial_epoll(struct ais_sock_tcp_srv *srv)
 	if (epoll_ctl(srv->ep_fd, EPOLL_CTL_ADD, srv->fd, &ev) < 0)
 		return -errno;
 
+	ev.events = EPOLLIN;
+	ev.data.u64 = 0;
+	ev.data.ptr = srv;
+	ev.data.u64 |= AIS_EV_DATA_EV_FD;
+	if (epoll_ctl(srv->ep_fd, EPOLL_CTL_ADD, srv->ev_fd, &ev) < 0)
+		return -errno;
+
 	return 0;
 }
 
@@ -459,6 +481,7 @@ int ais_sock_tcp_srv_run(struct ais_sock_tcp_srv *srv)
 void ais_sock_tcp_srv_stop(struct ais_sock_tcp_srv *srv)
 {
 	srv->should_stop = true;
+	eventfd_write(srv->ev_fd, 1);
 }
 
 int ais_sock_buf_init(struct ais_sock_buf *sb, uint16_t size)

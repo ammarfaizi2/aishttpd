@@ -80,6 +80,12 @@ struct ais_sock_tcp_srv {
 	 */
 	int			ep_fd;
 
+	/*
+	 * Eventfd for waking up the epoll wait loop.
+	 * Useful for signaling server shutdown.
+	 */
+	int			ev_fd;
+
 	int			sock_backlog;
 	struct ais_sock_addr	bind_addr;
 
@@ -151,6 +157,7 @@ void ais_sock_buf_advance(struct ais_sock_buf *sb, uint16_t len);
 enum {
 	AIS_EV_DATA_TCP_SRV = (1ull << 48ull),
 	AIS_EV_DATA_TCP_CLI = (2ull << 48ull),
+	AIS_EV_DATA_EV_FD   = (3ull << 48ull),
 };
 
 #define AIS_EV_GET_DATA(X)	((X) & 0xffff000000000000ull)
