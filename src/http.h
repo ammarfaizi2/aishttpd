@@ -5,4 +5,6 @@
 #ifndef AISHTTPD_HTTP_H
 #define AISHTTPD_HTTP_H
 
+int start_http(void);
+
 #endif /* #ifndef AISHTTPD_HTTP_H */
