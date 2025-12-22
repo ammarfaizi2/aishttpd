@@ -282,26 +282,24 @@ static int adjust_epoll_events(struct ais_sock_tcp_srv *srv, struct ais_sock_tcp
 	bool need_mod = false;
 	/*
 	 * TODO(viro_ssfs):
-	 *  - Simplify the logic of this function.
 	 *  - Add handling for EPOLLIN enabling/disabling as well (when the rx_buf is full).
 	 */
 
 	/*
-	 * If we still have data to send and EPOLLOUT is not yet
-	 * enabled, enable it now!
+	 * Handle EPOLLOUT enabling/disabling. If the EPOLLOUT is enabled,
+	 * but there's no data to send, disable it. If the EPOLLOUT is
+	 * disabled, but there's data to send, enable it.
 	 */
-	if (cli->tx_buf.off > 0 && !(cli->ep_mask & EPOLLOUT)) {
-		need_mod = true;
-		cli->ep_mask |= EPOLLOUT;
-	}
-
-	/*
-	 * If we have no more data to send and EPOLLOUT is enabled,
-	 * disable it.
-	 */
-	if (cli->tx_buf.off == 0 && (cli->ep_mask & EPOLLOUT)) {
-		need_mod = true;
-		cli->ep_mask &= ~EPOLLOUT;
+	if (cli->ep_mask & EPOLLOUT) {
+		if (cli->tx_buf.off == 0) {
+			need_mod = true;
+			cli->ep_mask &= ~EPOLLOUT;
+		}
+	} else {
+		if (cli->tx_buf.off > 0) {
+			need_mod = true;
+			cli->ep_mask |= EPOLLOUT;
+		}
 	}
 
 	if (need_mod) {
