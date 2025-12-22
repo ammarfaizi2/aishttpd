@@ -19,10 +19,6 @@
  *
  */
 
-struct http_client {
-	char	str_ip[INET6_ADDRSTRLEN + sizeof(":65535")];
-};
-
 static void store_str_ip(struct ais_sock_addr *addr, char *buf, size_t buf_len)
 {
 	size_t len;
@@ -40,103 +36,179 @@ static void store_str_ip(struct ais_sock_addr *addr, char *buf, size_t buf_len)
 	}
 }
 
-static ssize_t recv_callback(struct ais_sock_tcp_cli *cli)
+static const char *get_method_name(int m)
 {
-	static const char res[] = 
+	switch (m) {
+	case GWNET_HTTP_METHOD_GET:
+		return "GET";
+	case GWNET_HTTP_METHOD_POST:
+		return "POST";
+	case GWNET_HTTP_METHOD_PUT:
+		return "PUT";
+	case GWNET_HTTP_METHOD_DELETE:
+		return "DELETE";
+	case GWNET_HTTP_METHOD_HEAD:
+		return "HEAD";
+	case GWNET_HTTP_METHOD_OPTIONS:
+		return "OPTIONS";
+	case GWNET_HTTP_METHOD_PATCH:
+		return "PATCH";
+	case GWNET_HTTP_METHOD_TRACE:
+		return "TRACE";
+	case GWNET_HTTP_METHOD_CONNECT:
+		return "CONNECT";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static int handle_route_index(struct ais_sock_tcp_cli *cli)
+{
+	static const char res[] =
 		"HTTP/1.1 200 OK\r\n"
 		"Content-Type: text/plain\r\n"
-		"Content-Length: 14\r\n"
-		"Connection: close\r\n"
+		"Content-Length: 24\r\n"
+		"\r\n"
+		"Welcome to HTTP server!\n";
+	size_t len = sizeof(res) - 1;
+
+	return ais_sock_buf_append_grow(&cli->tx_buf, res, len);
+}
+
+static int handle_route_hello(struct ais_sock_tcp_cli *cli)
+{
+	static const char res[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Type: text/plain\r\n"
+		"Content-Length: 13\r\n"
 		"\r\n"
 		"Hello, World!\n";
-	struct http_client *hc = cli->user_data;
+	size_t len = sizeof(res) - 1;
+
+	return ais_sock_buf_append_grow(&cli->tx_buf, res, len);
+}
+
+static int handle_route_404(struct ais_sock_tcp_cli *cli)
+{
+	static const char res[] =
+		"HTTP/1.1 404 Not Found\r\n"
+		"Content-Type: text/plain\r\n"
+		"Content-Length: 14\r\n"
+		"\r\n"
+		"404 Not Found\n";
+	size_t len = sizeof(res) - 1;
+
+	return ais_sock_buf_append_grow(&cli->tx_buf, res, len);
+}
+
+static int handle_route(struct ais_sock_tcp_cli *cli, struct ais_http_req *req)
+{
+	const char *uri = req->hdr.uri;
+
+	printf("HTTP Request from %s: %s %s HTTP/1.%d\n",
+		req->addr,
+		get_method_name(req->hdr.method),
+		uri,
+		req->hdr.version == GWNET_HTTP_VER_1_1 ? 1 : 0);
+
+	if (!strcmp(uri, "/"))
+		return handle_route_index(cli);
+
+	if (!strcmp(uri, "/hello"))
+		return handle_route_hello(cli);
+
+	/* 404 Not Found */
+	return handle_route_404(cli);
+}
+
+static ssize_t http_recv_callback(struct ais_sock_tcp_cli *cli)
+{
+	struct ais_http_req *req = cli->user_data;
+	struct gwnet_http_hdr_pctx *pctx = &req->hdr_pctx;
 	int r;
 
-	printf("Received data from client %s: %s\n", hc->str_ip, cli->rx_buf.buf);
-	r = ais_sock_buf_append_grow(&cli->tx_buf, res, sizeof(res) - 1);
+	pctx->off = 0;
+	pctx->buf = cli->rx_buf.buf;
+	pctx->len = cli->rx_buf.off;
+	pctx->max_len = 4096; /* 4 KiB */
+	r = gwnet_http_req_hdr_parse(pctx, &req->hdr);
+	if (r == -EAGAIN) {
+		/*
+		 * Need more data...
+		 */
+		return 0;
+	}
+
+	if (r != 0)
+		return r;
+
+	/*
+	 * Successfully parsed the HTTP request header.
+	 * Now handle the route.
+	 */
+	r = handle_route(cli, req);
 	if (r < 0)
 		return r;
 
-	return (ssize_t)cli->rx_buf.off;
+	return pctx->off;
 }
 
-static int send_callback(struct ais_sock_tcp_cli *cli, ssize_t sent_len)
+static int http_send_callback(struct ais_sock_tcp_cli *cli, ssize_t sent_len)
 {
-	struct http_client *hc = cli->user_data;
-	printf("Sent %zd bytes to client %s\n", sent_len, hc->str_ip);
+	(void)cli;
+	(void)sent_len;
 	return 0;
 }
 
-static void close_callback(struct ais_sock_tcp_cli *cli)
+static void http_close_callback(struct ais_sock_tcp_cli *cli)
 {
-	struct http_client *hc = cli->user_data;
-	printf("Connection with client %s closed\n", hc->str_ip);
-	free(hc);
+	struct ais_http_req *req = cli->user_data;
+	gwnet_http_hdr_pctx_free(&req->hdr_pctx);
+	gwnet_http_req_hdr_free(&req->hdr);
+	free(req);
 }
 
-static int accept_callback(struct ais_sock_tcp_cli *cli)
+static int http_accept_callback(struct ais_sock_tcp_cli *cli)
 {
-	struct http_client *hc;
-	hc = malloc(sizeof(*hc));
-	if (!hc)
-		return -ENOMEM;
-
-	store_str_ip(&cli->addr, hc->str_ip, sizeof(hc->str_ip));
-	cli->user_data = hc;
-	ais_sock_tcp_cli_set_cb_rx(cli, &recv_callback);
-	ais_sock_tcp_cli_set_cb_close(cli, &close_callback);
-	ais_sock_tcp_cli_set_cb_tx(cli, &send_callback);
-	return 0;
-}
-
-struct ais_sock_tcp_srv *g_srv;
-
-static void handle_exit_signal(int sig)
-{
-	(void)sig;
-	ais_sock_tcp_srv_stop(g_srv);
-}
-
-static void setup_signal(struct ais_sock_tcp_srv *srv)
-{
-	struct sigaction sa;
-
-	g_srv = srv;
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = &handle_exit_signal;
-	sigaction(SIGINT, &sa, NULL);
-	sigaction(SIGTERM, &sa, NULL);
-	sigaction(SIGHUP, &sa, NULL);
-	sa.sa_handler = SIG_IGN;
-	sigaction(SIGPIPE, &sa, NULL);
-}
-
-int start_http(void)
-{
-	struct ais_sock_tcp_srv_iarg iarg = {
-		.bind_addr = "::",
-		.port = 9980,
-		.sock_backlog = 128,
-		.epoll_nevents = 64,
-		.max_clients = 1024,
-	};
-	struct ais_sock_tcp_srv srv;
+	struct ais_http_req *req;
 	int r;
 
-	setup_signal(&srv);
-	r = ais_sock_tcp_srv_init(&srv, &iarg);
+	req = calloc(1, sizeof(*req));
+	if (!req)
+		return -ENOMEM;
+
+	r = gwnet_http_hdr_pctx_init(&req->hdr_pctx);
 	if (r < 0) {
-		fprintf(stderr, "Failed to initialize TCP server: %d\n", r);
-		return -r;
+		free(req);
+		return r;
 	}
 
-	ais_sock_tcp_srv_set_cb_accept(&srv, &accept_callback);
-	printf("Starting TCP server on [%s]:%hu...\n", iarg.bind_addr, iarg.port);
-	r = ais_sock_tcp_srv_run(&srv);
-	if (r < 0)
-		fprintf(stderr, "Failed to run TCP server: %d\n", r);
+	store_str_ip(&cli->addr, req->addr, sizeof(req->addr));
+	cli->user_data = req;
+	ais_sock_tcp_cli_set_cb_rx(cli, &http_recv_callback);
+	ais_sock_tcp_cli_set_cb_tx(cli, &http_send_callback);
+	ais_sock_tcp_cli_set_cb_close(cli, &http_close_callback);
+	return 0;
+}
 
-	printf("Shutting down TCP server...\n");
-	ais_sock_tcp_srv_free(&srv);
-	return -r;
+int ais_http_ctx_init(struct ais_http_ctx *ctx, const struct ais_sock_tcp_srv_iarg *iarg)
+{
+	int r;
+
+	r = ais_sock_tcp_srv_init(&ctx->tcp_srv, (struct ais_sock_tcp_srv_iarg *)iarg);
+	if (r < 0)
+		return r;
+
+	ais_sock_tcp_srv_set_cb_accept(&ctx->tcp_srv, &http_accept_callback);
+	return 0;
+}
+
+int ais_http_ctx_run(struct ais_http_ctx *ctx)
+{
+	return ais_sock_tcp_srv_run(&ctx->tcp_srv);
+}
+
+void ais_http_ctx_free(struct ais_http_ctx *ctx)
+{
+	ais_sock_tcp_srv_free(&ctx->tcp_srv);
 }

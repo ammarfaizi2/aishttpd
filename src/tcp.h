@@ -123,7 +123,7 @@ struct ais_sock_tcp_srv_iarg {
 	size_t		max_clients;
 };
 
-int ais_sock_tcp_srv_init(struct ais_sock_tcp_srv *srv, struct ais_sock_tcp_srv_iarg *iarg);
+int ais_sock_tcp_srv_init(struct ais_sock_tcp_srv *srv, const struct ais_sock_tcp_srv_iarg *iarg);
 void ais_sock_tcp_srv_free(struct ais_sock_tcp_srv *srv);
 
 static inline void ais_sock_tcp_srv_set_cb_accept(struct ais_sock_tcp_srv *srv, ais_sock_tcp_srv_cb_accept_t cb)

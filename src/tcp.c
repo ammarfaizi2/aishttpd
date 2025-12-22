@@ -12,7 +12,7 @@
 #include <sys/eventfd.h>
 #include <assert.h>
 
-int ais_sock_tcp_srv_init(struct ais_sock_tcp_srv *srv, struct ais_sock_tcp_srv_iarg *iarg)
+int ais_sock_tcp_srv_init(struct ais_sock_tcp_srv *srv, const struct ais_sock_tcp_srv_iarg *iarg)
 {
 	struct ais_sock_addr *ba = &srv->bind_addr;
 	int err, fd, ep_fd, ev_fd;
