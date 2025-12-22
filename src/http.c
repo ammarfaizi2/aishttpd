@@ -195,7 +195,7 @@ int ais_http_ctx_init(struct ais_http_ctx *ctx, const struct ais_sock_tcp_srv_ia
 {
 	int r;
 
-	r = ais_sock_tcp_srv_init(&ctx->tcp_srv, (struct ais_sock_tcp_srv_iarg *)iarg);
+	r = ais_sock_tcp_srv_init(&ctx->tcp_srv, iarg);
 	if (r < 0)
 		return r;
 
