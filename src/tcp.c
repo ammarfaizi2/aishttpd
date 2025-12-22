@@ -454,7 +454,6 @@ static int prepare_initial_epoll(struct ais_sock_tcp_srv *srv)
 	ev.data.u64 = 0;
 	ev.data.ptr = srv;
 	ev.data.u64 |= AIS_EV_DATA_TCP_SRV;
-
 	if (epoll_ctl(srv->ep_fd, EPOLL_CTL_ADD, srv->fd, &ev) < 0)
 		return -errno;
 
