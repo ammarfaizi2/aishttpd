@@ -317,6 +317,28 @@ static int adjust_epoll_events(struct ais_sock_tcp_srv *srv, struct ais_sock_tcp
 	return 0;
 }
 
+static void ais_sock_tcp_srv_close_cli(struct ais_sock_tcp_srv *srv, struct ais_sock_tcp_cli *cli)
+{
+	uint32_t last_idx = (uint32_t)(srv->nclients - 1);
+	struct ais_sock_tcp_cli **clients = srv->clients;
+
+	epoll_ctl(srv->ep_fd, EPOLL_CTL_DEL, cli->fd, NULL);
+
+	/*
+	 * If the closed client is not the last one in the array,
+	 * move the last one to its place to keep the array dense.
+	 * Also update the moved client's index accordingly.
+	 */
+	if (cli->idx != last_idx) {
+		clients[cli->idx] = clients[last_idx];
+		clients[cli->idx]->idx = cli->idx;
+	}
+
+	clients[last_idx] = NULL;
+	srv->nclients--;
+	ais_sock_tcp_cli_free(cli);
+}
+
 static int handle_event_tcp_cli(struct ais_sock_tcp_srv *srv, struct epoll_event *ev, void *udata)
 {
 	struct ais_sock_tcp_cli *cli = udata;
@@ -351,17 +373,9 @@ static int handle_event_tcp_cli(struct ais_sock_tcp_srv *srv, struct epoll_event
 	return adjust_epoll_events(srv, cli);
 
 out_close:
-	if (ret < 0) {
-		uint32_t last_idx = (uint32_t)(srv->nclients - 1);
-		epoll_ctl(srv->ep_fd, EPOLL_CTL_DEL, cli->fd, NULL);
-		if (cli->idx != last_idx) {
-			srv->clients[cli->idx] = srv->clients[last_idx];
-			srv->clients[cli->idx]->idx = cli->idx;
-		}
-		srv->clients[last_idx] = NULL;
-		srv->nclients--;
-		ais_sock_tcp_cli_free(cli);
-	}
+	if (ret < 0)
+		ais_sock_tcp_srv_close_cli(srv, cli);
+
 	return 0;
 }
 
