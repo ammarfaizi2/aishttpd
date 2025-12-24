@@ -40,20 +40,22 @@ static void store_str_ip(struct ais_sock_addr *addr, char *buf, size_t buf_len)
 	}
 }
 
+static const char res[] =
+	"HTTP/1.1 200 OK\r\n"
+	"Content-Type: text/plain\r\n"
+	"Content-Length: 14\r\n"
+	"Connection: close\r\n"
+	"\r\n"
+	"Hello, World!\n";
+static const size_t res_len = sizeof(res) - 1;
+
 static ssize_t recv_callback(struct ais_sock_tcp_cli *cli)
 {
-	static const char res[] = 
-		"HTTP/1.1 200 OK\r\n"
-		"Content-Type: text/plain\r\n"
-		"Content-Length: 14\r\n"
-		"Connection: close\r\n"
-		"\r\n"
-		"Hello, World!\n";
 	struct http_client *hc = cli->user_data;
 	int r;
 
 	printf("Received data from client %s: %s\n", hc->str_ip, cli->rx_buf.buf);
-	r = ais_sock_buf_append_grow(&cli->tx_buf, res, sizeof(res) - 1);
+	r = ais_sock_buf_append_grow(&cli->tx_buf, res, res_len);
 	if (r < 0)
 		return r;
 
@@ -64,6 +66,10 @@ static int send_callback(struct ais_sock_tcp_cli *cli, ssize_t sent_len)
 {
 	struct http_client *hc = cli->user_data;
 	printf("Sent %zd bytes to client %s\n", sent_len, hc->str_ip);
+
+	if (!cli->tx_buf.off)
+		shutdown(cli->fd, SHUT_RDWR);
+
 	return 0;
 }
 
