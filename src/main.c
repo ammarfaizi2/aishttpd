@@ -3,8 +3,32 @@
  * Copyright (C) 2025  Alviro Iskandar Setiawan <alviro.iskandar@gnuweeb.org>
  */
 #include "http.h"
+#include <stdio.h>
 
 int main(void)
 {
-	return start_http();
+	static const struct ais_sock_tcp_srv_iarg iarg = {
+		.bind_addr = "::",
+		.port = 9980,
+		.sock_backlog = 128,
+		.epoll_nevents = 64,
+		.max_clients = 1024,
+	};
+	struct ais_http_ctx http_ctx;
+	int r;
+
+	r = ais_http_ctx_init(&http_ctx, &iarg);
+	if (r < 0) {
+		fprintf(stderr, "Failed to initialize HTTP context: %d\n", r);
+		return -r;
+	}
+
+	printf("Starting HTTP server on [%s]:%hu...\n", iarg.bind_addr, iarg.port);
+	r = ais_http_ctx_run(&http_ctx);
+	if (r < 0)
+		fprintf(stderr, "Failed to run HTTP server: %d\n", r);
+
+	printf("Shutting down HTTP server...\n");
+	ais_http_ctx_free(&http_ctx);
+	return -r;
 }
